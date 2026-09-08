@@ -5,7 +5,6 @@ set(LOCH_HEADERS
     lxImgIO.h
     lxOptDlg.h
     lxRender.h
-    lxR2P.h
     lxSScene.h
     lxSView.h
     lxWX.h
@@ -16,10 +15,10 @@ set(LOCH_HEADERS
     lxLRUD.h
     lxOGLFT.h
     lxPres.h
-    lxR2D.h
     lxSetup.h
     lxSTree.h
     lxSStats.h
+    lxTriGeom.h
 )
 
 set(LOCH_SOURCES
@@ -39,4 +38,17 @@ set(LOCH_SOURCES
     lxSScene.cxx
     lxSView.cxx
     lxSStats.cxx
+    lxTriGeom.cxx
 )
+
+set(LOCH_LOCALES bg cs de en_GB es fr it ru sk sl)
+# we need to set the files as sources only on macOS
+if (APPLE)
+    foreach(LOCALE ${LOCH_LOCALES})
+        set(LOCALE_FILE "${CMAKE_BINARY_DIR}/loch/locale/${LOCALE}/LC_MESSAGES/loch.mo")
+        list(APPEND LOCH_SOURCES ${LOCALE_FILE})
+        set_source_files_properties(${LOCALE_FILE} PROPERTIES
+            MACOSX_PACKAGE_LOCATION Resources/${LOCALE}.lproj
+            GENERATED TRUE)
+    endforeach()
+endif()
