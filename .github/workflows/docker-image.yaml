@@ -3,32 +3,122 @@ name: Build and Push Docker Image
 on:
   push:
     branches:
-      - master  # Trigger on pushes to the master branch
-  workflow_dispatch:  # Allow manual triggering of the workflow
+      - master
+  # Pull requests build the image but do not publish it, so a change to
+  # the Dockerfile can be checked before it becomes :latest for every
+  # repository that depends on this image.
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/therion
 
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
-
+  # Build each architecture on its own native runner and push it by
+  # digest. Building arm64 under QEMU on an amd64 runner works but takes
+  # the best part of an hour for a C++ project this size; the arm runners
+  # are free for public repositories and finish in the usual time.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
-      # Checkout the repository
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # Log in to GitHub Container Registry
-      - name: Log in to GHCR
-        uses: docker/login-action@v2
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build the Docker image
-      - name: Build Docker image
-        run: |
-          docker build -t ghcr.io/${{ github.repository_owner }}/therion:latest .
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          push: ${{ github.event_name != 'pull_request' }}
+          outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', env.IMAGE) }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
-      # Push the Docker image to GHCR
-      - name: Push Docker image
+      - name: Export digest
+        if: github.event_name != 'pull_request'
         run: |
-          docker push ghcr.io/${{ github.repository_owner }}/therion:latest
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Stitch the per-architecture images into one multi-arch tag, so
+  # `docker run` picks the right one automatically and Apple Silicon
+  # stops falling back to emulation.
+  merge:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # e.g. "Therion 6.4.0 (2026-05-07):" -> 6.4.0
+      - name: Read Therion version
+        id: ver
+        run: |
+          v=$(sed -n '1s/^Therion \([0-9][0-9.]*\).*/\1/p' CHANGES)
+          echo "version=${v:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "Therion version: ${v:-unknown}"
+
+      - name: Create and push manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:${{ steps.ver.outputs.version }}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Show what was published
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:latest"
+          {
+            echo "### Pushed \`${IMAGE}\`"
+            echo
+            echo "- \`latest\`"
+            echo "- \`${{ steps.ver.outputs.version }}\`"
+            echo
+            echo "Platforms: linux/amd64, linux/arm64"
+          } >> "$GITHUB_STEP_SUMMARY"
